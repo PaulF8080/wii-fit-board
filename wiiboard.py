@@ -13,6 +13,9 @@ import time
 import logging
 import collections
 import bluetooth
+import numpy as np
+import math
+from struct import *
 
 # Wiiboard Parameters
 CONTINUOUS_REPORTING    = b'\x04'
@@ -56,7 +59,8 @@ class Wiiboard:
     def __init__(self, address=None):
         self.controlsocket = bluetooth.BluetoothSocket(bluetooth.L2CAP)
         self.receivesocket = bluetooth.BluetoothSocket(bluetooth.L2CAP)
-        self.calibration = [[1e4]*4]*3
+        self.data_list = []
+        self.calibration = []
         self.calibration_requested = False
         self.light_state = False
         self.button_down = False
@@ -86,20 +90,7 @@ class Wiiboard:
     def status(self):
         self.send(COMMAND_REQUEST_STATUS, b'\x00')
     def calc_mass(self, raw, pos):
-        # Calculates the Kilogram weight reading from raw data at position pos
-        # calibration[0] is calibration values for 0kg
-        # calibration[1] is calibration values for 17kg
-        # calibration[2] is calibration values for 34kg
-        if raw < self.calibration[0][pos]:
-            return 0.0
-        elif raw < self.calibration[1][pos]:
-            return 17 * ((raw - self.calibration[0][pos]) /
-                         float((self.calibration[1][pos] -
-                                self.calibration[0][pos])))
-        else: # if raw >= self.calibration[1][pos]:
-            return 17 + 17 * ((raw - self.calibration[1][pos]) /
-                              float((self.calibration[2][pos] -
-                                     self.calibration[1][pos])))
+        return self.calibration[pos][0]*raw + self.calibration[pos][1]/raw + self.calibration[pos][2]*math.log10(raw)
     def check_button(self, state):
         if state == BUTTON_DOWN_MASK:
             if not self.button_down:
@@ -132,12 +123,21 @@ class Wiiboard:
                 logger.debug("Got calibration data")
                 if self.calibration_requested:
                     length = b2i(data[4]) / 16 + 1
-                    data = data[7:7 + length]
                     cal = lambda d: [b2i(d[j:j+2]) for j in [0, 2, 4, 6]]
                     if length == 16: # First packet of calibration data
-                        self.calibration = [cal(data[0:8]), cal(data[8:16]), [1e4]*4]
+                        self.data_list = list(unpack('>xxxxxxxHHHHHHHH', data))
                     elif length < 16: # Second packet of calibration data
-                        self.calibration[2] = cal(data[0:8])
+                        self.data_list.extend(list(unpack('>xxxxxxxHHHHxxxxxxxx', data)))
+                        ary = np.array(self.data_list).reshape(4,3, order='F')
+                        y = np.array((0.0, 17.0, 34.0))
+                        ans = []
+                        for i in range(len(ary)) :
+                            l = []
+                            for j in range(len(ary[i])) :
+                                l.append([ary[i][j], 1.0/ary[i][j], math.log10(ary[i][j])])
+                            x = np.array(l)
+                            ans.extend(list(np.linalg.solve(x, y)))
+                        self.calibration = np.array(ans).reshape(4,3)
                         self.calibration_requested = False
                         self.on_calibrated()
             elif input_type == EXTENSION_8BYTES:
@@ -188,7 +188,7 @@ class WiiboardPrint(WiiboardSampling):
     def on_sample(self):
         if len(self.samples) == N_SAMPLES:
             samples = [sum(sample.values()) for sample in self.samples]
-            print("%.3f %.3f"%(time.time(), sum(samples) / len(samples)))
+            print("%.3f %.3f %.3f %.3f" % (time.time(), np.mean(samples), np.median(samples), np.std(samples)))
             self.samples.clear()
             self.status() # Stop the board from publishing mass data
             self.nloop += 1
